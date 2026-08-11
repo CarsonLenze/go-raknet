@@ -36,6 +36,10 @@ type Conn struct {
 	// rtt is the last measured round-trip time between both ends of the
 	// connection. The rtt is measured in nanoseconds.
 	rtt atomic.Int64
+	// connectedPing holds the most recently sent connected ping so that its
+	// round-trip time can be measured with higher precision than RakNet's
+	// millisecond timestamp permits.
+	connectedPing atomic.Pointer[connectedPingMeasurement]
 
 	closing atomic.Int64
 
@@ -92,6 +96,11 @@ type Conn struct {
 	retransmission *resendMap
 
 	lastActivity atomic.Pointer[time.Time]
+}
+
+type connectedPingMeasurement struct {
+	timestamp int64
+	sent      time.Time
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -171,7 +180,10 @@ func (conn *Conn) startTicking() {
 			}
 			if i%5 == 0 {
 				// Ping the other end periodically to prevent timeouts.
-				_ = conn.send(&message.ConnectedPing{PingTime: timestamp()})
+				pingTime := timestamp()
+				conn.connectedPing.Store(&connectedPingMeasurement{timestamp: pingTime, sent: time.Now()})
+				b, _ := (&message.ConnectedPing{PingTime: pingTime}).MarshalBinary()
+				_, _ = conn.writeWithReliability(b, reliabilityUnreliable)
 
 				conn.mu.Lock()
 				if t.Sub(*conn.lastActivity.Load()) > time.Second*5+conn.retransmission.rtt(t)*2 {
@@ -213,8 +225,6 @@ func (conn *Conn) checkResend(now time.Time) {
 		rtt    = conn.retransmission.rtt(now)
 		delay  = rtt + rtt/2
 	)
-	conn.rtt.Store(int64(rtt))
-
 	for seq, t := range conn.retransmission.unacknowledged {
 		// These packets have not been acknowledged for too long: We resend them
 		// by ourselves, even though no NACK has been issued yet.
@@ -378,9 +388,10 @@ func (conn *Conn) SetWriteDeadline(time.Time) error { return ErrNotSupported }
 // SetDeadline is unimplemented. It always returns ErrNotSupported.
 func (conn *Conn) SetDeadline(time.Time) error { return ErrNotSupported }
 
-// Latency returns a rolling average of rtt between the sending and the
-// receiving end of the connection. The rtt returned is updated continuously
-// and is half the average round trip time (RTT).
+// Latency returns half of the most recently measured round-trip time between
+// the sending and receiving end of the connection. RTT is measured using
+// RakNet connected ping and pong packets rather than transport acknowledgements,
+// whose batching and retransmission delays do not represent network latency.
 func (conn *Conn) Latency() time.Duration {
 	return time.Duration(conn.rtt.Load() / 2)
 }
